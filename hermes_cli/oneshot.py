@@ -32,6 +32,17 @@ from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
 
 
+_CODEX_TERMINAL_AUTH_CODES = {
+    "codex_auth_missing",
+    "codex_auth_invalid_shape",
+    "codex_auth_missing_access_token",
+    "codex_auth_missing_refresh_token",
+    "invalid_grant",
+    "invalid_token",
+    "refresh_token_reused",
+}
+
+
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
     if not toolsets:
         return None
@@ -54,6 +65,11 @@ def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | No
     normalized = _normalize_toolsets(toolsets)
     if normalized is None:
         return None, None
+
+    if any(name.lower() == "none" for name in normalized):
+        if len(normalized) != 1:
+            return None, "hermes -z: --toolsets none cannot be combined with other toolsets.\n"
+        return [], None
 
     try:
         from toolsets import validate_toolset
@@ -148,6 +164,8 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             "api_calls": result.get("api_calls"),
             "model": result.get("model"),
             "provider": result.get("provider"),
+            "fallback_used": bool(result.get("fallback_used")),
+            "fallback_reason": result.get("fallback_reason"),
             "session_id": result.get("session_id"),
             "completed": result.get("completed"),
             "failed": bool(result.get("failed")) or failure is not None,
@@ -171,6 +189,8 @@ def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    fallback_model: Optional[str] = None,
+    fallback_provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
 ) -> int:
@@ -182,6 +202,10 @@ def run_oneshot(
             env var, then config.yaml's model.default / model.model.
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
+        fallback_model: Optional one-shot fallback model override. Must be
+            paired with ``fallback_provider``.
+        fallback_provider: Optional one-shot fallback provider override. Must
+            be paired with ``fallback_model``.
         toolsets: Optional comma-separated string or iterable of toolsets.
         usage_file: Optional path; when set, a JSON usage report (estimated
             cost, token counts, model, api_calls) is written there after the
@@ -207,6 +231,14 @@ def run_oneshot(
         sys.stderr.write(
             "hermes -z: --provider requires --model (or HERMES_INFERENCE_MODEL). "
             "Pass both explicitly, or neither to use your configured defaults.\n"
+        )
+        return 2
+
+    fallback_model = (fallback_model or "").strip() or None
+    fallback_provider = (fallback_provider or "").strip() or None
+    if bool(fallback_model) != bool(fallback_provider):
+        sys.stderr.write(
+            "hermes -z: --fallback-provider and --fallback-model must be provided together.\n"
         )
         return 2
 
@@ -246,6 +278,8 @@ def run_oneshot(
                     prompt,
                     model=model,
                     provider=provider,
+                    fallback_model=fallback_model,
+                    fallback_provider=fallback_provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
                 )
@@ -323,6 +357,8 @@ def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    fallback_model: Optional[str] = None,
+    fallback_provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
 ) -> tuple[str, dict]:
@@ -396,16 +432,50 @@ def _run_agent(
                 if detected:
                     effective_provider, effective_model = detected
 
-    runtime = resolve_runtime_provider(
-        requested=effective_provider,
-        target_model=effective_model or None,
-        explicit_base_url=explicit_base_url_from_alias,
-    )
+    fallback_model = (fallback_model or "").strip() or None
+    fallback_provider = (fallback_provider or "").strip() or None
+    explicit_fallback = bool(fallback_model and fallback_provider)
+    pre_agent_fallback_reason: str | None = None
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    pre_agent_primary_error: AuthError | None = None
+
+    try:
+        runtime = resolve_runtime_provider(
+            requested=effective_provider,
+            target_model=effective_model or None,
+            explicit_base_url=explicit_base_url_from_alias,
+        )
+    except AuthError as exc:
+        if (
+            not explicit_fallback
+            or (exc.provider or "").strip().lower() != "openai-codex"
+            or exc.code in {"invalid_provider", "no_provider_configured"}
+        ):
+            raise
+        if is_rate_limited_auth_error(exc):
+            pre_agent_fallback_reason = "rate_limit"
+        elif exc.relogin_required and exc.code in _CODEX_TERMINAL_AUTH_CODES:
+            pre_agent_fallback_reason = "auth_permanent"
+        else:
+            raise
+        pre_agent_primary_error = exc
+        try:
+            runtime = resolve_runtime_provider(
+                requested=fallback_provider,
+                target_model=fallback_model,
+            )
+        except Exception as fallback_error:
+            raise exc from fallback_error
+        effective_model = fallback_model
+        effective_provider = fallback_provider
 
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
     # sets; explicit values preserve user order.
-    toolsets_list = _normalize_toolsets(toolsets)
+    if isinstance(toolsets, (list, tuple)) and not toolsets:
+        toolsets_list = []
+    else:
+        toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
@@ -433,34 +503,48 @@ def _run_agent(
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
         # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        if explicit_fallback:
+            _fb = [] if pre_agent_fallback_reason else [
+                {
+                    "provider": fallback_provider,
+                    "model": fallback_model,
+                    "_fallback_policy": "strict_oneshot",
+                }
+            ]
+        else:
+            _fb = get_fallback_chain(cfg)
 
-        agent = AIAgent(
-            api_key=runtime.get("api_key"),
-            base_url=runtime.get("base_url"),
-            provider=runtime.get("provider"),
-            requested_provider=runtime.get("requested_provider"),
-            api_mode=runtime.get("api_mode"),
-            model=effective_model,
-            enabled_toolsets=toolsets_list,
-            quiet_mode=True,
-            platform="cli",
-            session_db=session_db,
-            credential_pool=runtime.get("credential_pool"),
-            fallback_model=_fb or None,
-            # Interactive callbacks are intentionally NOT wired beyond this
-            # one.  In oneshot mode there's no user sitting at a terminal:
-            #   - clarify  → returns a synthetic "pick a default" instruction
-            #                so the agent continues instead of stalling on
-            #                the tool's built-in "not available" error
-            #   - sudo password prompt → terminal_tool gates on
-            #                HERMES_INTERACTIVE which we never set
-            #   - shell-hook approval → auto-approved via HERMES_ACCEPT_HOOKS=1
-            #                (set above); also falls back to deny on non-tty
-            #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
-            #   - skill secret capture → returns gracefully when no callback set
-            clarify_callback=_oneshot_clarify_callback,
-        )
+        try:
+            agent = AIAgent(
+                api_key=runtime.get("api_key"),
+                base_url=runtime.get("base_url"),
+                provider=runtime.get("provider"),
+                requested_provider=runtime.get("requested_provider"),
+                api_mode=runtime.get("api_mode"),
+                model=effective_model,
+                enabled_toolsets=toolsets_list,
+                quiet_mode=True,
+                platform="cli",
+                session_db=session_db,
+                credential_pool=runtime.get("credential_pool"),
+                fallback_model=_fb or None,
+                # Interactive callbacks are intentionally NOT wired beyond this
+                # one.  In oneshot mode there's no user sitting at a terminal:
+                #   - clarify  → returns a synthetic "pick a default" instruction
+                #                so the agent continues instead of stalling on
+                #                the tool's built-in "not available" error
+                #   - sudo password prompt → terminal_tool gates on
+                #                HERMES_INTERACTIVE which we never set
+                #   - shell-hook approval → auto-approved via HERMES_ACCEPT_HOOKS=1
+                #                (set above); also falls back to deny on non-tty
+                #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
+                #   - skill secret capture → returns gracefully when no callback set
+                clarify_callback=_oneshot_clarify_callback,
+            )
+        except Exception as fallback_error:
+            if pre_agent_primary_error is not None:
+                raise pre_agent_primary_error from fallback_error
+            raise
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.
@@ -469,6 +553,16 @@ def _run_agent(
         agent.tool_gen_callback = None
 
         result = agent.run_conversation(prompt)
+        result["model"] = getattr(agent, "model", result.get("model"))
+        result["provider"] = getattr(agent, "provider", result.get("provider"))
+        result["fallback_used"] = bool(
+            pre_agent_fallback_reason
+            or getattr(agent, "_fallback_activated", False)
+        )
+        result["fallback_reason"] = (
+            pre_agent_fallback_reason
+            or getattr(agent, "_fallback_reason", None)
+        )
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,

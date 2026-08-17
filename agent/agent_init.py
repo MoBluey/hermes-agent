@@ -1309,9 +1309,19 @@ def init_agent(
                     if isinstance(fallback_model, list):
                         _fb_entries = [
                             f for f in fallback_model
-                            if isinstance(f, dict) and f.get("provider") and f.get("model")
+                            if (
+                                isinstance(f, dict)
+                                and f.get("provider")
+                                and f.get("model")
+                                and f.get("_fallback_policy") != "strict_oneshot"
+                            )
                         ]
-                    elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
+                    elif (
+                        isinstance(fallback_model, dict)
+                        and fallback_model.get("provider")
+                        and fallback_model.get("model")
+                        and fallback_model.get("_fallback_policy") != "strict_oneshot"
+                    ):
                         _fb_entries = [fallback_model]
                     _fb_resolved = False
                     for _fb in _fb_entries:

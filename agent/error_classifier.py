@@ -360,6 +360,7 @@ _MODEL_NOT_FOUND_PATTERNS = [
     "is not a valid model",
     "invalid model",
     "model not found",
+    "model was not found",
     "model_not_found",
     "does not exist",
     "no such model",
@@ -840,6 +841,18 @@ def classify_api_error(
         )
         return _result(reason, **plugin_classification)
 
+    # The stream helpers raise a dedicated type when no usable provider event
+    # arrives. Its message is not stable enough for string classification.
+    from agent.errors import EmptyStreamError
+
+    if isinstance(error, EmptyStreamError):
+        return _result(
+            FailoverReason.server_error,
+            retryable=True,
+            should_compress=False,
+            error_context={"empty_provider_response": True},
+        )
+
     # ── 1. Provider-specific patterns (highest priority) ────────────
 
     # Provider content-policy / safety-filter block. The provider has made a
@@ -1155,6 +1168,113 @@ def _classify_by_status(
 ) -> Optional[ClassifiedError]:
     """Classify based on HTTP status code with message-aware refinement."""
 
+    billing_ambiguity = _billing_ambiguity_context(error_msg)
+    if billing_ambiguity:
+        return result_fn(
+            FailoverReason.billing,
+            retryable=False,
+            should_rotate_credential=True,
+            should_fallback=True,
+            error_context=billing_ambiguity,
+        )
+
+    # Gate deterministic semantic failures before status-only auth/rate/server
+    # handling. Aggregators sometimes wrap these bodies in 401/403/429/5xx;
+    # the body still describes a request that cannot recover via provider
+    # failover or retry.
+    error_code_lower = error_code.lower()
+    if any(p in error_msg for p in _PROVIDER_POLICY_BLOCKED_PATTERNS):
+        return result_fn(
+            FailoverReason.provider_policy_blocked,
+            retryable=False,
+            should_fallback=False,
+        )
+    if (
+        any(
+            p in error_msg
+            for p in _MODEL_NOT_FOUND_PATTERNS
+            if p != "does not exist"
+        )
+        or ("does not exist" in error_msg and "model" in error_msg)
+        or error_code_lower in {"model_not_found", "model_not_available", "invalid_model"}
+    ):
+        return result_fn(
+            FailoverReason.model_not_found,
+            retryable=False,
+            should_fallback=True,
+        )
+    if any(p in error_msg for p in _MULTIMODAL_TOOL_CONTENT_PATTERNS):
+        return result_fn(
+            FailoverReason.multimodal_tool_content_unsupported,
+            retryable=True,
+        )
+    if any(p in error_msg for p in _IMAGE_TOO_LARGE_PATTERNS):
+        return result_fn(
+            FailoverReason.image_too_large,
+            retryable=True,
+        )
+    if (
+        error_code_lower == "invalid_encrypted_content"
+        or "invalid_encrypted_content" in error_msg
+        or ("encrypted_content" in error_msg and "could not be verified" in error_msg)
+        or (
+            "encrypted content for item" in error_msg
+            and "could not be verified" in error_msg
+        )
+        or "could not decrypt the provided encrypted_content" in error_msg
+    ):
+        return result_fn(
+            FailoverReason.invalid_encrypted_content,
+            retryable=True,
+            should_fallback=False,
+        )
+    if status_code != 400 and (
+        any(p in error_msg for p in _INVALID_MESSAGE_BODY_PATTERNS)
+        or error_code_lower == "invalid_request_body"
+    ):
+        return result_fn(
+            FailoverReason.format_error,
+            retryable=False,
+            should_fallback=True,
+        )
+    if any(p in error_msg for p in _EMPTY_PROVIDER_RESPONSE_PATTERNS):
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
+            should_compress=False,
+            error_context={"empty_provider_response": True},
+        )
+    if (
+        any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS)
+        or error_code_lower in {"context_length_exceeded", "max_tokens_exceeded"}
+    ):
+        return result_fn(
+            FailoverReason.context_overflow,
+            retryable=True,
+            should_compress=True,
+        )
+    if any(p in error_msg for p in _PAYLOAD_TOO_LARGE_PATTERNS):
+        return result_fn(
+            FailoverReason.payload_too_large,
+            retryable=True,
+            should_compress=True,
+        )
+    if (
+        any(
+            p in error_msg
+            for p in _REQUEST_VALIDATION_PATTERNS
+            if p != "invalid_request_error"
+        )
+        or (status_code != 400 and "invalid_request_error" in error_msg)
+        or error_code_lower in {"unknown_parameter", "unsupported_parameter"}
+        or (status_code != 400 and error_code_lower == "invalid_request_error")
+    ):
+        return result_fn(
+            FailoverReason.format_error,
+            retryable=False,
+            should_fallback=True,
+        )
+
     if status_code == 401:
         # Not retryable on its own — credential pool rotation and
         # provider-specific refresh (Codex, Anthropic, Nous) run before
@@ -1303,23 +1423,6 @@ def _classify_by_status(
         )
 
     if status_code in {500, 502}:
-        # Some OpenAI-compatible gateways return request-validation errors
-        # with a 5xx status (codex.nekos.me returns 502 for unknown/
-        # unsupported parameters). These are deterministic — every retry
-        # gets the identical rejection — so the generic "5xx → retryable
-        # server_error" rule turns one bad request into a retry flood.
-        # Detect the unambiguous request-validation signals (in either the
-        # message text or the structured error code) and fail fast.
-        if (
-            any(p in error_msg for p in _REQUEST_VALIDATION_PATTERNS)
-            or error_code.lower() in {"invalid_request_error", "unknown_parameter",
-                                      "unsupported_parameter"}
-        ):
-            return result_fn(
-                FailoverReason.format_error,
-                retryable=False,
-                should_fallback=True,
-            )
         # Some local inference servers (notably llama.cpp / llama-server)
         # report context overflow with an HTTP 500 instead of the standard
         # 400/413. The request-validation guard above already ran, so any
@@ -1333,6 +1436,7 @@ def _classify_by_status(
                 FailoverReason.server_error,
                 retryable=True,
                 should_compress=False,
+                error_context={"empty_provider_response": True},
             )
         if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
             return result_fn(
@@ -1340,7 +1444,11 @@ def _classify_by_status(
                 retryable=True,
                 should_compress=True,
             )
-        return result_fn(FailoverReason.server_error, retryable=True)
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
+            error_context={"verified_http_5xx": True},
+        )
 
     if status_code in {503, 529}:
         # Same overflow-as-5xx variant (server busy / model-load OOM, or a
@@ -1352,6 +1460,7 @@ def _classify_by_status(
                 FailoverReason.server_error,
                 retryable=True,
                 should_compress=False,
+                error_context={"empty_provider_response": True},
             )
         if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
             return result_fn(
@@ -1382,7 +1491,11 @@ def _classify_by_status(
 
     # Other 5xx — retryable
     if 500 <= status_code < 600:
-        return result_fn(FailoverReason.server_error, retryable=True)
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
+            error_context={"verified_http_5xx": True},
+        )
 
     return None
 
@@ -1537,6 +1650,7 @@ def _classify_400(
             FailoverReason.server_error,
             retryable=True,
             should_compress=False,
+            error_context={"empty_provider_response": True},
         )
 
     # Context overflow from 400
@@ -1783,6 +1897,7 @@ def _classify_by_message(
             FailoverReason.server_error,
             retryable=True,
             should_compress=False,
+            error_context={"empty_provider_response": True},
         )
 
     # Context overflow patterns

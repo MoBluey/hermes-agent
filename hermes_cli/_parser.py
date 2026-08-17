@@ -149,6 +149,22 @@ def build_top_level_parser():
             "under model.provider — use `hermes setup` or edit the file to change it."
         ),
     )
+    parser.add_argument(
+        "--fallback-provider",
+        default=None,
+        help=(
+            "One-shot mode only: provider to use if the explicit primary fails. "
+            "Must be paired with --fallback-model."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-model",
+        default=None,
+        help=(
+            "One-shot mode only: model to use if the explicit primary fails. "
+            "Must be paired with --fallback-provider."
+        ),
+    )
     _inherited_flag(
         parser,
         "--reasoning",

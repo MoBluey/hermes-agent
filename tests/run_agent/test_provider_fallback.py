@@ -119,6 +119,51 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert agent.model == "gpt-4o"
 
+    def test_failed_activation_rolls_back_runtime_state(self):
+        agent = _make_agent(
+            fallback_model=[{"provider": "anthropic", "model": "claude-sonnet-5"}]
+        )
+        agent.provider = "openrouter"
+        agent.requested_provider = "openrouter"
+        agent.model = "openai/gpt-5"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.api_mode = "chat_completions"
+        agent.api_key = "primary-key"
+        agent._fallback_reason = None
+        original_client = agent.client
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(
+                        base_url="https://api.anthropic.com",
+                        api_key="fallback-key",
+                    ),
+                    "claude-sonnet-5",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, _provider: model,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                side_effect=RuntimeError("fallback client build failed"),
+            ),
+        ):
+            assert agent._try_activate_fallback() is False
+
+        assert agent.provider == "openrouter"
+        assert agent.requested_provider == "openrouter"
+        assert agent.model == "openai/gpt-5"
+        assert agent.base_url == "https://openrouter.ai/api/v1"
+        assert agent.api_mode == "chat_completions"
+        assert agent.api_key == "primary-key"
+        assert agent.client is original_client
+        assert agent._fallback_activated is False
+        assert agent._fallback_reason is None
+
     def test_resolves_key_env_for_fallback_provider(self):
         fbs = [
             {

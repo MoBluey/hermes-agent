@@ -178,6 +178,8 @@ def _run_and_exit_oneshot(
     *,
     model: object = None,
     provider: object = None,
+    fallback_model: object = None,
+    fallback_provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
 ) -> None:
@@ -188,6 +190,8 @@ def _run_and_exit_oneshot(
             prompt,
             model=model,
             provider=provider,
+            fallback_model=fallback_model,
+            fallback_provider=fallback_provider,
             toolsets=toolsets,
             usage_file=usage_file,
         )
@@ -574,6 +578,8 @@ def _apply_profile_override() -> None:
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--fallback-model",
+        "--fallback-provider",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -11442,6 +11448,8 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-z", "--oneshot",
         "-m", "--model",
         "--provider",
+        "--fallback-model",
+        "--fallback-provider",
         "-t", "--toolsets",
         "-r", "--resume",
         "-s", "--skills",
@@ -11749,6 +11757,8 @@ def _try_fast_chat_launch() -> bool:
             args.oneshot,
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            fallback_model=getattr(args, "fallback_model", None),
+            fallback_provider=getattr(args, "fallback_provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
         )
@@ -11806,6 +11816,8 @@ def _try_termux_fast_cli_launch() -> bool:
             args.oneshot,
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            fallback_model=getattr(args, "fallback_model", None),
+            fallback_provider=getattr(args, "fallback_provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
         )
@@ -13600,6 +13612,8 @@ def main():
             args.oneshot,
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
+            fallback_model=getattr(args, "fallback_model", None),
+            fallback_provider=getattr(args, "fallback_provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
         )

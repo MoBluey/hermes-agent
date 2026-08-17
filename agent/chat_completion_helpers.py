@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
+    ClassifiedError,
     FailoverReason,
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
 )
@@ -2424,7 +2425,50 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def _fallback_allowed_for_entry(
+    entry: dict,
+    classified: "ClassifiedError | None",
+) -> bool:
+    """Apply the restricted policy carried by an explicit one-shot entry."""
+    if entry.get("_fallback_policy") != "strict_oneshot":
+        return True
+    if classified is None:
+        return False
+    if classified.reason not in {
+        FailoverReason.auth,
+        FailoverReason.auth_permanent,
+        FailoverReason.billing,
+        FailoverReason.rate_limit,
+        FailoverReason.upstream_rate_limit,
+        FailoverReason.overloaded,
+        FailoverReason.timeout,
+        FailoverReason.server_error,
+    }:
+        return False
+    context = classified.error_context or {}
+    if classified.reason == FailoverReason.billing and (
+        context.get("billing_unverified") or context.get("possible_content_filter")
+    ):
+        return False
+    if classified.reason == FailoverReason.server_error:
+        return bool(context.get("verified_http_5xx")) and not context.get(
+            "empty_provider_response"
+        )
+    return True
+
+
+def _try_next_fallback(agent, reason, classified) -> bool:
+    if classified is None:
+        return agent._try_activate_fallback(reason)
+    return agent._try_activate_fallback(reason=reason, classified=classified)
+
+
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    classified: "ClassifiedError | None" = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2436,6 +2480,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if agent._fallback_index < len(agent._fallback_chain):
+        pending_entry = agent._fallback_chain[agent._fallback_index]
+        if not _fallback_allowed_for_entry(pending_entry, classified):
+            return False
+    if classified is not None:
+        reason = classified.reason
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -2484,11 +2534,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return _try_next_fallback(agent, reason, classified)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return _try_next_fallback(agent, reason, classified)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2499,7 +2549,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return _try_next_fallback(agent, reason, classified)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2524,11 +2574,43 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return _try_next_fallback(agent, reason, classified)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
+    _fallback_missing = object()
+    _fallback_runtime_snapshot = None
+    _fallback_transport_snapshot = _fallback_missing
+    _fallback_compressor_snapshot = None
+
+    def _restore_failed_fallback() -> None:
+        if _fallback_runtime_snapshot is None:
+            return
+        for name, value in _fallback_runtime_snapshot.items():
+            try:
+                if value is _fallback_missing:
+                    if hasattr(agent, name):
+                        delattr(agent, name)
+                else:
+                    setattr(agent, name, value)
+            except Exception:
+                pass
+        if _fallback_transport_snapshot is not _fallback_missing:
+            cache = getattr(agent, "_transport_cache", None)
+            try:
+                cache.clear()
+                cache.update(_fallback_transport_snapshot)
+            except Exception:
+                pass
+        if _fallback_compressor_snapshot is not None:
+            compressor, state = _fallback_compressor_snapshot
+            try:
+                compressor.__dict__.clear()
+                compressor.__dict__.update(state)
+            except Exception:
+                pass
+
     try:
         from agent.auxiliary_client import resolve_provider_client
         # Pass base_url and api_key from fallback config so custom
@@ -2581,7 +2663,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return _try_next_fallback(agent, reason, classified)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2643,6 +2725,48 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         old_model = agent.model
         old_provider = agent.provider
 
+        _fallback_runtime_snapshot = {
+            name: getattr(agent, name, _fallback_missing)
+            for name in (
+                "model",
+                "provider",
+                "requested_provider",
+                "base_url",
+                "api_mode",
+                "api_key",
+                "client",
+                "_client_kwargs",
+                "_anthropic_client",
+                "_anthropic_api_key",
+                "_anthropic_base_url",
+                "_is_anthropic_oauth",
+                "_config_context_length",
+                "_credential_pool",
+                "_credential_pool_entry_id",
+                "_use_prompt_caching",
+                "_use_native_cache_layout",
+                "reasoning_config",
+                "_cached_system_prompt",
+                "_fallback_activated",
+                "_fallback_reason",
+                "_pending_fallback_notice",
+                "_consecutive_stale_streams",
+            )
+        }
+        if _fallback_runtime_snapshot["_client_kwargs"] is not _fallback_missing:
+            _fallback_runtime_snapshot["_client_kwargs"] = dict(
+                _fallback_runtime_snapshot["_client_kwargs"] or {}
+            )
+        transport_cache = getattr(agent, "_transport_cache", _fallback_missing)
+        if transport_cache is not _fallback_missing:
+            try:
+                _fallback_transport_snapshot = dict(transport_cache)
+            except Exception:
+                _fallback_transport_snapshot = _fallback_missing
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is not None and hasattr(compressor, "__dict__"):
+            _fallback_compressor_snapshot = (compressor, dict(compressor.__dict__))
+
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
         # the stale value from the previous model.  See #22387.
@@ -2654,7 +2778,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.api_mode = fb_api_mode
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
-        agent._fallback_activated = True
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -2833,12 +2956,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
+        agent._fallback_activated = True
+        agent._fallback_reason = reason.value if reason is not None else None
         return True
     except Exception as e:
+        _restore_failed_fallback()
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return _try_next_fallback(agent, reason, classified)  # try next in chain
 
 
 

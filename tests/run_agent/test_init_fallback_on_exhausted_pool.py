@@ -67,3 +67,39 @@ def test_init_raises_when_no_fallback_configured():
                 skip_memory=True,
                 fallback_model=None,
             )
+
+
+def test_init_does_not_use_restricted_oneshot_fallback_without_classification():
+    """The one-shot entry is only eligible after a classified provider failure."""
+    calls = []
+
+    def fake_resolve(provider, **_kwargs):
+        calls.append(provider)
+        if provider == "tencent-token-plan":
+            return _mock_client(), "kimi2.5"
+        return None, None
+
+    with patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve), \
+         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()), \
+         patch("run_agent.check_toolset_requirements", return_value={}), \
+         patch("run_agent.OpenAI", return_value=MagicMock()):
+
+        with pytest.raises(RuntimeError, match="no API key was found"):
+            AIAgent(
+                provider="alibaba-coding-plan",
+                model="qwen3.6-plus",
+                api_key=None,
+                base_url=None,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=[
+                    {
+                        "provider": "tencent-token-plan",
+                        "model": "kimi2.5",
+                        "_fallback_policy": "strict_oneshot",
+                    }
+                ],
+            )
+
+    assert calls == ["alibaba-coding-plan"]

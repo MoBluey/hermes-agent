@@ -98,6 +98,31 @@ class TestAuthFailoverActivation:
         assert advanced is True
         assert agent._fallback_index == 1
 
+    def test_classified_auth_activates_restricted_oneshot_entry(self):
+        agent = _make_agent(
+            fallback_model=[
+                {
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "_fallback_policy": "strict_oneshot",
+                }
+            ]
+        )
+        classified = classify_api_error(_auth_error(401))
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
+            advanced = agent._try_activate_fallback(
+                reason=classified.reason,
+                classified=classified,
+            )
+
+        assert advanced is True
+        assert agent._fallback_index == 1
+        assert agent._fallback_reason == classified.reason.value
+
     def test_no_failover_without_chain(self):
         """A user with no fallback configured (the common case for the
         original incident) does NOT failover — falls through to the

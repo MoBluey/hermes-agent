@@ -296,16 +296,138 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.server_error
         assert result.retryable is True
+        assert result.error_context.get("verified_http_5xx") is True
 
     def test_502_server_error(self):
         e = MockAPIError("Bad Gateway", status_code=502)
         result = classify_api_error(e)
         assert result.reason == FailoverReason.server_error
+        assert result.error_context.get("verified_http_5xx") is True
 
     def test_503_overloaded(self):
         e = MockAPIError("Service Unavailable", status_code=503)
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
+
+    def test_other_5xx_server_error_is_verified(self):
+        e = MockAPIError("Gateway Timeout", status_code=504)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.server_error
+        assert result.error_context.get("verified_http_5xx") is True
+
+    @pytest.mark.parametrize("status_code", [401, 403, 429, 500, 503, 504])
+    @pytest.mark.parametrize(
+        ("message", "expected_reason"),
+        [
+            ("The requested model was not found", FailoverReason.model_not_found),
+            (
+                "No endpoints available matching your data policy",
+                FailoverReason.provider_policy_blocked,
+            ),
+            ("Unknown parameter: tools", FailoverReason.format_error),
+            (
+                "No endpoints found that support tool use",
+                FailoverReason.model_not_found,
+            ),
+        ],
+    )
+    def test_deterministic_semantics_precede_provider_failure_status(
+        self, status_code, message, expected_reason
+    ):
+        result = classify_api_error(MockAPIError(message, status_code=status_code))
+
+        assert result.reason == expected_reason
+        assert result.error_context.get("verified_http_5xx") is not True
+
+    @pytest.mark.parametrize("status_code", [401, 403, 429])
+    def test_provider_policy_semantics_precede_auth_status(self, status_code):
+        result = classify_api_error(
+            MockAPIError(
+                "No endpoints available matching your data policy",
+                status_code=status_code,
+            )
+        )
+
+        assert result.reason == FailoverReason.provider_policy_blocked
+        assert result.should_fallback is False
+
+    def test_auth_message_with_does_not_exist_is_not_model_not_found(self):
+        result = classify_api_error(
+            MockAPIError("The supplied API key does not exist", status_code=401)
+        )
+
+        assert result.reason == FailoverReason.auth
+
+    @pytest.mark.parametrize("status_code", [401, 403, 429, 500, 503, 504])
+    def test_invalid_request_code_precedes_allowed_status(self, status_code):
+        result = classify_api_error(
+            MockAPIError(
+                "Request validation failed",
+                status_code=status_code,
+                body={"error": {"code": "invalid_request_error"}},
+            )
+        )
+
+        assert result.reason == FailoverReason.format_error
+
+    @pytest.mark.parametrize(
+        ("message", "expected_reason", "context_key"),
+        [
+            ("Provider returned an empty response", FailoverReason.server_error, "empty_provider_response"),
+            ("Context length exceeded", FailoverReason.context_overflow, None),
+            ("Payload too large", FailoverReason.payload_too_large, None),
+        ],
+    )
+    def test_specific_semantics_precede_generic_invalid_request_code(
+        self, message, expected_reason, context_key
+    ):
+        result = classify_api_error(
+            MockAPIError(
+                message,
+                status_code=503,
+                body={"error": {"code": "invalid_request_error"}},
+            )
+        )
+
+        assert result.reason == expected_reason
+        if context_key:
+            assert result.error_context.get(context_key) is True
+
+    @pytest.mark.parametrize(
+        ("status_code", "message", "expected_reason"),
+        [
+            (500, "All messages must have non-empty content", FailoverReason.format_error),
+            (504, "Context length exceeded", FailoverReason.context_overflow),
+            (
+                503,
+                "Invalid encrypted_content could not be verified",
+                FailoverReason.invalid_encrypted_content,
+            ),
+            (504, "Image exceeds maximum size", FailoverReason.image_too_large),
+            (502, "Payload too large", FailoverReason.payload_too_large),
+            (
+                500,
+                "Tool message content must be a string",
+                FailoverReason.multimodal_tool_content_unsupported,
+            ),
+        ],
+    )
+    def test_wrapped_deterministic_5xx_is_not_verified_server_failure(
+        self, status_code, message, expected_reason
+    ):
+        result = classify_api_error(MockAPIError(message, status_code=status_code))
+
+        assert result.reason == expected_reason
+        assert result.error_context.get("verified_http_5xx") is not True
+
+    def test_empty_stream_error_type_is_tagged_even_without_matching_message(self):
+        from agent.errors import EmptyStreamError
+
+        result = classify_api_error(EmptyStreamError("unknown {}"))
+
+        assert result.reason == FailoverReason.server_error
+        assert result.error_context.get("empty_provider_response") is True
+        assert result.error_context.get("verified_http_5xx") is not True
 
 
     def test_408_request_timeout_is_retryable_timeout(self):
@@ -1290,5 +1412,3 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
-
