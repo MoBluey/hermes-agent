@@ -42,6 +42,7 @@ import {
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveRemoteSshDashboardProfile,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
@@ -56,6 +57,17 @@ test('connectionScopeKey trims to a name or null for the global scope', () => {
   assert.equal(connectionScopeKey(''), null)
   assert.equal(connectionScopeKey(null), null)
   assert.equal(connectionScopeKey(undefined), null)
+})
+
+test('resolveRemoteSshDashboardProfile never sends a conn: pool key to the remote', () => {
+  // Clicking Mac Mini / Spark default used `remoteProfile || poolKey`, which
+  // spawned a dashboard for the fictional profile "conn:mac-mini::default".
+  assert.equal(resolveRemoteSshDashboardProfile('', 'conn:mac-mini::default'), '')
+  assert.equal(resolveRemoteSshDashboardProfile(undefined, 'conn:spark::default'), '')
+  assert.equal(resolveRemoteSshDashboardProfile('', 'conn:mac-mini::dixie'), 'dixie')
+  assert.equal(resolveRemoteSshDashboardProfile('', 'bob'), 'bob')
+  assert.equal(resolveRemoteSshDashboardProfile('', 'default'), '')
+  assert.equal(resolveRemoteSshDashboardProfile('writer', 'conn:mac-mini::default'), 'writer')
 })
 
 test('normAuthMode coerces to token unless explicitly oauth', () => {
@@ -345,6 +357,30 @@ const ROUTES = [
     name: 'a local non-primary profile gets its own pooled backend',
     profile: 'coder',
     opts: { primaryProfile: 'default', globalRemote: false, profileRemoteOverride: false },
+    expected: { backend: 'pool', descriptorProfile: null, scopePath: false }
+  },
+  {
+    name: 'a remote sub-profile without a local entry routes through the primary remote gateway',
+    profile: 'pm',
+    opts: {
+      primaryProfile: 'default',
+      globalRemote: false,
+      profileRemoteOverride: false,
+      primaryRemoteActive: true,
+      ownEntry: false
+    },
+    expected: { backend: 'primary', descriptorProfile: 'pm', scopePath: true }
+  },
+  {
+    name: 'a sub-profile with its own local entry still pools locally under a remote primary',
+    profile: 'pm',
+    opts: {
+      primaryProfile: 'default',
+      globalRemote: false,
+      profileRemoteOverride: false,
+      primaryRemoteActive: true,
+      ownEntry: true
+    },
     expected: { backend: 'pool', descriptorProfile: null, scopePath: false }
   }
 ]
