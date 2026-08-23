@@ -6550,12 +6550,15 @@ def resolve_provider_client(
             custom_base = _to_openai_base_url(explicit_base_url).strip()
             if api_mode == "anthropic_messages":
                 wrap_base = (explicit_base_url or "").strip().rstrip("/")
-            custom_key = (
-                (explicit_api_key or "").strip()
-                or _scoped_key_env("OPENAI_API_KEY")
-                or _read_main_api_key_if_same_host(custom_base)
-                or "no-key-required"  # local servers don't need auth
-            )
+            if callable(explicit_api_key) and not isinstance(explicit_api_key, str):
+                custom_key = explicit_api_key
+            else:
+                custom_key = (
+                    (explicit_api_key or "").strip()
+                    or _scoped_key_env("OPENAI_API_KEY")
+                    or _read_main_api_key_if_same_host(custom_base)
+                    or "no-key-required"  # local servers don't need auth
+                )
             if not custom_base:
                 logger.warning(
                     "resolve_provider_client: explicit custom endpoint requested "

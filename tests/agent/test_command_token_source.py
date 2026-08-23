@@ -347,3 +347,26 @@ class TestAuxiliaryResolverHonoursKeyCmd:
         assert self._resolve(
             monkeypatch, {**self.BASE, "key_cmd": "   "}
         ) == "no-key-required"
+
+    def test_explicit_custom_endpoint_preserves_callable_key(self, monkeypatch):
+        """The active custom route may pass its key_cmd provider explicitly."""
+        import agent.auxiliary_client as ac
+
+        source = CommandTokenSource("printf minted-token", "dbx")
+        seen = {}
+
+        def _spy(*, api_key, base_url, **kw):
+            seen["api_key"] = api_key
+            return SimpleNamespace(api_key=api_key, base_url=base_url)
+
+        monkeypatch.setattr(ac, "_create_openai_client", _spy)
+
+        ac.resolve_provider_client(
+            "custom",
+            model="m1",
+            explicit_base_url="https://example.invalid/v1",
+            explicit_api_key=source,
+        )
+
+        assert seen["api_key"] is source
+        assert source._token == ""
