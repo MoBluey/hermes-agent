@@ -395,6 +395,64 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
     assert result.error_message == ""
 
 
+def test_switch_model_disambiguates_user_provider_named_like_builtin(monkeypatch):
+    """A configured ``providers.qwen`` endpoint must persist and rebuild as
+    ``custom:qwen`` rather than the built-in Qwen OAuth provider.
+    """
+    user_providers = {
+        "qwen": {
+            "name": "Local Qwen",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "key_cmd": "/usr/local/bin/local-llm-key",
+            "default_model": "Qwen3.8-27B-Uncensored-oQ4e-mtp",
+        }
+    }
+    requested_providers = []
+
+    def fake_runtime_provider(*, requested=None, **_kwargs):
+        requested_providers.append(requested)
+        return {
+            "provider": "custom",
+            "api_key": "local-key",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_mode": "chat_completions",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        fake_runtime_provider,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_args, **_kwargs: {
+            "accepted": True,
+            "persist": True,
+            "recognized": True,
+            "message": None,
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_info", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = switch_model(
+        raw_input="Qwen3.8-27B-Uncensored-oQ4e-mtp",
+        current_provider="anthropic",
+        current_model="claude-sonnet-4-6",
+        explicit_provider="qwen",
+        user_providers=user_providers,
+        custom_providers=[],
+    )
+
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom:qwen"
+    assert requested_providers == ["custom:qwen"]
+
+
 # =============================================================================
 # Regression: providers: dict ``transport`` field must be honored
 # =============================================================================

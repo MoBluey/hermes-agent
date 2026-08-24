@@ -1830,6 +1830,29 @@ def switch_model(
     # COMMON PATH: Resolve credentials, normalize, get metadata
     # =================================================================
 
+    # A keyed user endpoint may deliberately reuse a canonical built-in name
+    # (for example ``providers.qwen`` for a local OpenAI-compatible server).
+    # Bare ``qwen`` is not a durable routing identity: runtime resolution owns
+    # it as the built-in Qwen OAuth provider, so persisting it makes the next
+    # turn/resume leave the configured endpoint. Keep ordinary user-provider
+    # slugs unchanged, but disambiguate exact built-in collisions with the
+    # stable ``custom:<key>`` identity accepted by runtime_provider. Aliases
+    # count too: bare ``qwen`` currently canonicalises to ``qwen-oauth``.
+    if isinstance(user_providers, dict) and target_provider in user_providers:
+        try:
+            from hermes_cli.auth import resolve_provider as _resolve_auth_provider
+
+            builtin_provider = _resolve_auth_provider(target_provider)
+        except Exception:
+            builtin_provider = ""
+        if str(builtin_provider or "").strip():
+            user_provider_key = target_provider
+            target_provider = custom_provider_slug(
+                user_provider_key, user_provider_key
+            )
+            if not explicit_provider:
+                explicit_provider = user_provider_key
+
     provider_changed = target_provider != current_provider
     provider_label = get_label(target_provider)
     if target_provider == "custom" and current_base_url:
