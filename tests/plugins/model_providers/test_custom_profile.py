@@ -71,6 +71,32 @@ class TestCustomReasoningWireShape:
         assert tl == {"reasoning_effort": "none"}
 
     @pytest.mark.parametrize(
+        "model",
+        [
+            "Qwen3.8-27B-oQ6e-mtp",
+            "Qwen3.8-27B-MTPLX-Optimized-Speed",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [
+            {"enabled": False},
+            {"enabled": True, "effort": "none"},
+        ],
+        ids=["disabled", "none"],
+    )
+    def test_qwen38_disabled_uses_chat_template_control(
+        self, custom_profile, model, reasoning_config
+    ):
+        """Qwen3.8 rejects reasoning_effort='none' but honours enable_thinking."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config=reasoning_config,
+            model=model,
+        )
+        assert eb == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert tl == {}
+
+    @pytest.mark.parametrize(
         "effort", ["minimal", "low", "medium", "high", "xhigh", "max"]
     )
     def test_enabled_effort_goes_top_level(self, custom_profile, effort):
@@ -106,4 +132,3 @@ class TestCustomReasoningWithNumCtx:
         )
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
-

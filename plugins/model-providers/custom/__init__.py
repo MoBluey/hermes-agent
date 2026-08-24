@@ -4,7 +4,8 @@ Covers any endpoint registered as provider="custom", including local
 Ollama instances and OpenAI-compatible reasoning endpoints (GLM-5.2 on
 Volcengine ARK, vLLM, llama.cpp). Key quirks:
   - ollama_num_ctx → extra_body.options.num_ctx (local context window)
-  - reasoning_config disabled → top-level reasoning_effort="none"
+  - Qwen3.8 reasoning disabled → chat_template_kwargs.enable_thinking=False
+  - other reasoning_config disabled → top-level reasoning_effort="none"
     (Ollama /v1/chat/completions ignores think=False — ollama#14820)
     + extra_body.think = False for /api/chat and proxies
   - reasoning_config enabled + effort → top-level reasoning_effort
@@ -40,7 +41,8 @@ class CustomProfile(ProviderProfile):
         # Reasoning / thinking control for custom OpenAI-compatible endpoints
         # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).
         #
-        #   - disabled  → extra_body.think = False (Ollama's thinking-off flag)
+        #   - Qwen3.8 disabled → chat_template_kwargs.enable_thinking = False
+        #   - other disabled → extra_body.think = False (Ollama's thinking-off flag)
         #   - enabled + effort set → TOP-LEVEL reasoning_effort string, the
         #     format GLM-5.2/ARK and other OpenAI-compatible reasoning APIs
         #     expect (GLM documents "high" and "max"; "max" is its default).
@@ -55,14 +57,20 @@ class CustomProfile(ProviderProfile):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
-                # Ollama's /v1/chat/completions silently ignores
-                # extra_body.think (only /api/chat honours it — ollama#14820)
-                # but respects the top-level reasoning_effort field, so both
-                # are needed to actually stop a thinking-capable model from
-                # reasoning (#25758). Endpoints that recognize neither simply
-                # ignore them.
-                top_level["reasoning_effort"] = "none"
-                extra_body["think"] = False
+                model = str(ctx.get("model") or "").lower()
+                if model.startswith("qwen3.8-"):
+                    extra_body["chat_template_kwargs"] = {
+                        "enable_thinking": False
+                    }
+                else:
+                    # Ollama's /v1/chat/completions silently ignores
+                    # extra_body.think (only /api/chat honours it — ollama#14820)
+                    # but respects the top-level reasoning_effort field, so both
+                    # are needed to actually stop a thinking-capable model from
+                    # reasoning (#25758). Endpoints that recognize neither simply
+                    # ignore them.
+                    top_level["reasoning_effort"] = "none"
+                    extra_body["think"] = False
             elif _effort:
                 # Clamp the internal ladder onto the widest OpenAI-compatible
                 # wire vocabulary (shared policy in agent.reasoning_effort) —
