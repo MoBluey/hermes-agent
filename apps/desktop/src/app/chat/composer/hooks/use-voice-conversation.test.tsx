@@ -75,14 +75,33 @@ interface HookProps {
   busy: boolean
 }
 
-function renderConversation(overrides: { onInterrupt?: () => void; transcript?: string } = {}) {
+function deferred<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(next => {
+    resolve = next
+  })
+
+  return { promise, resolve }
+}
+
+function renderConversation(
+  overrides: {
+    beforeMicOpen?: () => Promise<void>
+    onInterrupt?: () => void
+    onSubmit?: (text: string) => Promise<void>
+    onTranscribeAudio?: (audio: Blob) => Promise<string>
+    transcript?: string
+  } = {}
+) {
   const onInterrupt = overrides.onInterrupt ?? vi.fn()
 
   // Mirrors the real app: submitting a turn makes the agent busy.
   const onBusyChange: { current: (busy: boolean) => void } = { current: () => undefined }
 
-  const onSubmit = vi.fn(async () => {
+  const onSubmit = vi.fn(async (text: string) => {
     onBusyChange.current(true)
+    await overrides.onSubmit?.(text)
   })
 
   const onStopWord = vi.fn()
@@ -91,14 +110,16 @@ function renderConversation(overrides: { onInterrupt?: () => void; transcript?: 
   // ones are barge captures (the overridable transcript).
   let transcriptions = 0
 
-  const onTranscribeAudio = vi.fn(async () =>
-    transcriptions++ === 0 ? 'kick off the task' : (overrides.transcript ?? 'and another thing')
+  const onTranscribeAudio = vi.fn(
+    overrides.onTranscribeAudio ??
+      (async () => (transcriptions++ === 0 ? 'kick off the task' : (overrides.transcript ?? 'and another thing')))
   )
 
   const hook = renderHook(
     ({ busy }: HookProps) =>
       useVoiceConversation({
         busy,
+        beforeMicOpen: overrides.beforeMicOpen,
         consumePendingResponse: vi.fn(),
         enabled: true,
         onInterrupt,
@@ -262,5 +283,169 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     hook.rerender({ busy: true })
 
     expect(monitorCalls.length).toBe(armed)
+  })
+
+  it('drops a normal transcription that resolves after the conversation ends', async () => {
+    const transcription = deferred<string>()
+
+    const { hook, onSubmit, onTranscribeAudio } = renderConversation({
+      onTranscribeAudio: () => transcription.promise
+    })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    micHandle.stop.mockResolvedValueOnce({
+      audio: new Blob(['voice'], { type: 'audio/webm' }),
+      durationMs: 900,
+      heardSpeech: true
+    })
+
+    act(() => hook.result.current.stopTurn())
+    await waitFor(() => expect(onTranscribeAudio).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      await hook.result.current.end()
+      transcription.resolve('phantom transcript')
+      await transcription.promise
+    })
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(hook.result.current.status).toBe('idle')
+  })
+
+  it('drops a barge transcription that resolves after the conversation ends', async () => {
+    const bargeTranscription = deferred<string>()
+    let transcriptionCount = 0
+
+    const { hook, onSubmit, onTranscribeAudio } = renderConversation({
+      onTranscribeAudio: async () => {
+        if (transcriptionCount++ === 0) {
+          return 'kick off the task'
+        }
+
+        return bargeTranscription.promise
+      }
+    })
+
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+    const monitor = monitorCalls.at(-1)
+
+    act(() => monitor?.onSpeech())
+    hook.rerender({ busy: false })
+    act(() => monitor?.onUtterance?.(new Blob(['barge'], { type: 'audio/webm' })))
+    await waitFor(() => expect(onTranscribeAudio).toHaveBeenCalledTimes(2))
+
+    await act(async () => {
+      await hook.result.current.end()
+      bargeTranscription.resolve('phantom interruption')
+      await bargeTranscription.promise
+    })
+
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(onSubmit).not.toHaveBeenCalledWith('phantom interruption')
+    expect(hook.result.current.status).toBe('idle')
+  })
+
+  it('does not open the microphone when start finishes after end', async () => {
+    const micBarrier = deferred<void>()
+    const { hook } = renderConversation({ beforeMicOpen: () => micBarrier.promise })
+
+    let startPromise!: Promise<void>
+    act(() => {
+      startPromise = hook.result.current.start()
+    })
+    await waitFor(() => expect(hook.result.current.status).toBe('idle'))
+
+    await act(async () => {
+      await hook.result.current.end()
+      micBarrier.resolve()
+      await startPromise
+    })
+
+    expect(micHandle.start).not.toHaveBeenCalled()
+    expect(hook.result.current.status).toBe('idle')
+  })
+
+  it('serializes a restarted conversation behind the cancelled microphone start', async () => {
+    const firstMicStart = deferred<undefined>()
+
+    micHandle.start.mockImplementationOnce(() => firstMicStart.promise).mockResolvedValueOnce(undefined)
+    const { hook } = renderConversation()
+
+    let firstStart!: Promise<void>
+    act(() => {
+      firstStart = hook.result.current.start()
+    })
+    await waitFor(() => expect(micHandle.start).toHaveBeenCalledTimes(1))
+    await act(async () => hook.result.current.end())
+
+    let secondStart!: Promise<void>
+    act(() => {
+      secondStart = hook.result.current.start()
+    })
+    expect(micHandle.start).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      firstMicStart.resolve(undefined)
+      await firstStart
+      await secondStart
+    })
+
+    expect(micHandle.start).toHaveBeenCalledTimes(2)
+    expect(micHandle.cancel).toHaveBeenCalledTimes(2)
+    const staleCancelOrder = micHandle.cancel.mock.invocationCallOrder.at(-1) ?? 0
+    const restartedMicOrder = micHandle.start.mock.invocationCallOrder[1] ?? 0
+
+    expect(staleCancelOrder).toBeLessThan(restartedMicOrder)
+    expect(hook.result.current.status).toBe('listening')
+  })
+
+  it('does not restore thinking after a normal submit settles following end', async () => {
+    const submission = deferred<void>()
+    const { hook, onSubmit } = renderConversation({ onSubmit: () => submission.promise })
+
+    await act(async () => hook.result.current.start())
+    micHandle.stop.mockResolvedValueOnce({
+      audio: new Blob(['voice'], { type: 'audio/webm' }),
+      durationMs: 900,
+      heardSpeech: true
+    })
+    act(() => hook.result.current.stopTurn())
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      await hook.result.current.end()
+      submission.resolve()
+      await submission.promise
+    })
+
+    expect(hook.result.current.status).toBe('idle')
+  })
+
+  it('does not restore thinking after a barge submit settles following end', async () => {
+    const submission = deferred<void>()
+
+    const { hook, onSubmit } = renderConversation({
+      onSubmit: text => (text === 'and another thing' ? submission.promise : Promise.resolve())
+    })
+
+    await enterThinking(hook)
+    await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
+    const monitor = monitorCalls.at(-1)
+
+    act(() => monitor?.onSpeech())
+    hook.rerender({ busy: false })
+    act(() => monitor?.onUtterance?.(new Blob(['barge'], { type: 'audio/webm' })))
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2))
+
+    await act(async () => {
+      await hook.result.current.end()
+      submission.resolve()
+      await submission.promise
+    })
+
+    expect(hook.result.current.status).toBe('idle')
   })
 })
