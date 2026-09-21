@@ -3122,8 +3122,10 @@ _PREPOSED_CONTINUE_CONDITION_RE = re.compile(
     r"|(?:^|[,;:]\s*)pending\s+"
     r"(?:(?:your|the|user|their)\s+)?(?:confirmation|approval|permission|consent|decision)\b"
     r"|(?:^|[,;:]\s*)(?:with|upon|awaiting|requires?|requiring|needs?|needing)\s+"
-    r"(?:your\s+|the\s+)?(?:confirmation|approval|permission)\b"
-    r"|(?:^|[,;:]\s*)(?:you|the user)\s+(?:confirm|approve|authori[sz]e|permit)\b",
+    r"(?:your\s+|the\s+)?(?:confirmation|approval|permission|consent|decision)\b"
+    r"|(?:^|[,;:]\s*)(?:you|the user)\s+"
+    r"(?:confirm(?:s|ed|ing)?|approve(?:s|d|ing)?|authori[sz]e(?:s|d|ing)?"
+    r"|permit(?:s|ted|ting)?|consent(?:s|ed|ing)?|decid(?:e|es|ed|ing))\b",
     re.IGNORECASE,
 )
 _POSTPOSED_CONTINUE_CONDITION_RE = re.compile(
@@ -3133,8 +3135,10 @@ _POSTPOSED_CONTINUE_CONDITION_RE = re.compile(
     r"|\bpending\s+(?:(?:your|the|user|their)\s+)?"
     r"(?:confirmation|approval|permission|consent|decision)\b"
     r"|\b(?:with|upon|awaiting|requires?|requiring|needs?|needing)\s+"
-    r"(?:your\s+|the\s+)?(?:confirmation|approval|permission)\b"
-    r"|\b(?:you|the user)\s+(?:confirm|approve|authori[sz]e|permit)\b",
+    r"(?:your\s+|the\s+)?(?:confirmation|approval|permission|consent|decision)\b"
+    r"|\b(?:you|the user)\s+"
+    r"(?:confirm(?:s|ed|ing)?|approve(?:s|d|ing)?|authori[sz]e(?:s|d|ing)?"
+    r"|permit(?:s|ted|ting)?|consent(?:s|ed|ing)?|decid(?:e|es|ed|ing))\b",
     re.IGNORECASE,
 )
 

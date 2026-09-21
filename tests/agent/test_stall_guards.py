@@ -436,11 +436,17 @@ def test_ignores_conditional_can_proceed_tails():
     clauses = [
         f"{gate} {authority}"
         for gate in ("with", "upon", "awaiting", "requires", "requiring", "needs", "needing")
-        for authority in ("your confirmation", "your approval", "the approval", "permission")
+        for authority in (
+            "your confirmation", "your approval", "the approval", "permission",
+            "your consent", "your decision",
+        )
     ] + [
         f"{subject} {verb}"
         for subject in ("you", "the user")
-        for verb in ("confirm", "approve", "authorise", "authorize", "permit")
+        for verb in (
+            "confirm", "confirmed", "approve", "authorise", "authorize", "permit",
+            "consent", "decide",
+        )
     ]
     for clause in clauses:
         replies.extend((
