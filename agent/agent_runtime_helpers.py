@@ -3223,16 +3223,49 @@ def tool_results_this_turn(messages: List[Dict[str, Any]]) -> int:
     return count
 
 
-# Narrow "trailing continue-intent" detector for the stall guard (agent.stall_guards): only the
-# message TAIL announcing a next action, so mid-sentence "I will" never trips it.
+# Conservative "trailing continue-intent" detector for the said-continue-but-
+# stopped stall guard (agent.stall_guards). Matches only when the message tail
+# announces an immediate next action, including a non-conditional "I can
+# proceed". Ordinary answers and conditional offers do not trip it.
 _TRAILING_CONTINUE_INTENT_RE = re.compile(
     r"(?:\blet me now\b|\bi(?:['\u2019])?ll now\b|\bi will now\b"
     r"|\bnow i(?:['\u2019]ll| will)\b|\bnext[,:] i\b)"
     r"[^.!?\n]{0,100}[.:\u2026]?\s*$", re.IGNORECASE,
 )
+_TRAILING_CAN_PROCEED_RE = re.compile(
+    r"\bi can proceed\b(?P<action>[^.!?\n]{0,100}[.:\u2026]?\s*)$", re.IGNORECASE,
+)
+_PREPOSED_CONTINUE_CONDITION_RE = re.compile(
+    r"(?:^|[,;:]\s*)(?:if|once|after|when|unless|until|assuming)\b"
+    r"|(?:^|[,;:]\s*)(?:provided\s+that|subject\s+to)\b"
+    r"|(?:^|[,;:]\s*)pending\s+"
+    r"(?:(?:your|the|user|their)\s+)?"
+    r"(?:confirmation|approval|permission|consent|decision|authori[sz]ation|go-ahead)\b"
+    r"|(?:^|[,;:]\s*)(?:with|upon|awaiting|requires?|requiring|needs?|needing)\s+"
+    r"(?:your\s+|the\s+)?"
+    r"(?:confirmation|approval|permission|consent|decision|authori[sz]ation|go-ahead)\b"
+    r"|(?:^|[,;:]\s*)(?:you|the user)\s+"
+    r"(?:confirm(?:s|ed|ing)?|approve(?:s|d|ing)?|authori[sz]e(?:s|d|ing)?"
+    r"|permit(?:s|ted|ting)?|consent(?:s|ed|ing)?|decid(?:e|es|ed|ing))\b",
+    re.IGNORECASE,
+)
+_POSTPOSED_CONTINUE_CONDITION_RE = re.compile(
+    r"\b(?:if|once|after|when|unless|until|assuming)\b"
+    r"|\bprovided\s+that\b"
+    r"|\bsubject\s+to\b"
+    r"|\bpending\s+(?:(?:your|the|user|their)\s+)?"
+    r"(?:confirmation|approval|permission|consent|decision|authori[sz]ation|go-ahead)\b"
+    r"|\b(?:with|upon|awaiting|requires?|requiring|needs?|needing)\s+"
+    r"(?:your\s+|the\s+)?"
+    r"(?:confirmation|approval|permission|consent|decision|authori[sz]ation|go-ahead)\b"
+    r"|\b(?:you|the user)\s+"
+    r"(?:confirm(?:s|ed|ing)?|approve(?:s|d|ing)?|authori[sz]e(?:s|d|ing)?"
+    r"|permit(?:s|ted|ting)?|consent(?:s|ed|ing)?|decid(?:e|es|ed|ing))\b",
+    re.IGNORECASE,
+)
 
-# Content longer than this is a substantive reply, not a dangling ack.
-_TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
+# Allow a short diagnostic summary before the dangling action announcement.
+_TRAILING_CONTINUE_INTENT_MAX_CHARS = 600
 
 
 def trailing_continue_intent(text: str) -> bool:
@@ -3240,7 +3273,19 @@ def trailing_continue_intent(text: str) -> bool:
     t = (text or "").strip()
     if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
         return False
-    return bool(_TRAILING_CONTINUE_INTENT_RE.search(t[-160:]))
+    tail = t[-160:]
+    if _TRAILING_CONTINUE_INTENT_RE.search(tail):
+        return True
+    proceed_match = _TRAILING_CAN_PROCEED_RE.search(t)
+    if proceed_match is None:
+        return False
+    clause_start = max(
+        t.rfind(mark, 0, proceed_match.start()) for mark in (".", "!", "?", "\n")
+    ) + 1
+    prefix = t[clause_start:proceed_match.start()]
+    if _PREPOSED_CONTINUE_CONDITION_RE.search(prefix):
+        return False
+    return not _POSTPOSED_CONTINUE_CONDITION_RE.search(proceed_match.group("action"))
 
 
 # Broader tail detector for PROMOTED REASONING only (reasoning-only clean stop with tools offered

@@ -349,6 +349,27 @@ def test_detects_trailing_next_i():
     assert trailing_continue_intent("Step one complete. Next: I run the tests")
 
 
+def test_detects_unconditional_can_proceed_tails():
+    long_reply = (
+        "I stopped because the first `exec` tool call failed due to an unavailable "
+        "tool name, and I was re-checking whether terminal/file-editing capabilities "
+        "were accessible before editing. The terminal tool itself works, and the "
+        "required capabilities are available.\n\nThe task list is still active, and "
+        "the current branch is `fix/validated-1-18`. The only pending file change is "
+        "in `CatalogSyncManager.kt`, specifically the `PAGE_CAP + 1` cursor write at "
+        "line 160. I can proceed with the first fix using that same terminal/file-"
+        "editing tool."
+    )
+    assert len(long_reply) == 533
+    for reply in (
+        long_reply,
+        "I can proceed with the provided configuration.",
+        "Okay, I can proceed with the fix.",
+        "I can proceed with the pending task.",
+    ):
+        assert trailing_continue_intent(reply), reply
+
+
 def test_ignores_intent_followed_by_more_content():
     # Intent phrase mid-message with substantive content after it — the model
     # already continued; nothing dangling.
@@ -378,6 +399,58 @@ def test_ignores_conversational_future_offers():
     assert not trailing_continue_intent(
         "If you want, I will happily review the PR once CI is green. Just say so!"
     )
+
+
+def test_ignores_conditional_can_proceed_tails():
+    replies = [
+        "I can proceed if you confirm that I should change the production database.",
+        "If you confirm, I can proceed with the production database change.",
+        (
+            "If you confirm that I should change the production database using the "
+            "migration described above and accept the associated downtime and the "
+            "rollback procedure for the customer records, I can proceed with the fix."
+        ),
+        "Once you confirm, I can proceed with the fix.",
+        "After you confirm, I can proceed with the fix.",
+        "When you confirm, I can proceed with the fix.",
+        "Unless you object, I can proceed with the fix.",
+        "Until you confirm, I can proceed with the fix.",
+        "Provided that you approve, I can proceed with the fix.",
+        "Assuming you approve, I can proceed with the fix.",
+        "Subject to your confirmation, I can proceed with the fix.",
+        "Pending your approval, I can proceed with the fix.",
+        "I can proceed once you confirm the production database change.",
+        "I can proceed after you confirm the production database change.",
+        "I can proceed when you confirm the production database change.",
+        "I can proceed subject to your confirmation.",
+        "I can proceed with your authorisation.",
+        "With your authorization, I can proceed.",
+        "I can proceed with your go-ahead.",
+    ]
+    clauses = [
+        f"{gate} {authority}"
+        for gate in ("with", "upon", "awaiting", "requires", "requiring", "needs", "needing")
+        for authority in (
+            "your confirmation", "your approval", "the approval", "permission",
+            "your consent", "your decision", "your authorisation", "your authorization",
+            "your go-ahead",
+        )
+    ] + [
+        f"{subject} {verb}"
+        for subject in ("you", "the user")
+        for verb in (
+            "confirm", "confirmed", "approve", "authorise", "authorize", "permit",
+            "consent", "decide",
+        )
+    ]
+    for clause in clauses:
+        replies.extend((
+            f"{clause.capitalize()}, I can proceed with the fix.",
+            f"Okay, {clause}, I can proceed with the fix.",
+            f"I can proceed with the fix {clause}.",
+        ))
+    for reply in replies:
+        assert not trailing_continue_intent(reply), reply
 
 
 # ── batch-cycle loop breaker (port of can1357/oh-my-pi#10521) ───────────────
