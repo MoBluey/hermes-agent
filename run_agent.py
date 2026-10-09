@@ -238,6 +238,17 @@ class _StreamErrorEvent(Exception):
         self.body: Dict[str, Any] = {"error": {"message": message, "code": code, "param": param, "type": "error"}}
 
 
+def _with_guardrail_recovery_note(agent, function_result):
+    """Append the halt-recovery note to the result that raised the turn's first halt, so the
+    persisted tool row carries exactly what the model sees on the recovery iteration."""
+    halt = getattr(agent, "_tool_guardrail_halt_decision", None)
+    note_fn = getattr(getattr(agent, "_tool_guardrails", None), "recovery_note", None)
+    note = note_fn(halt) if halt is not None and callable(note_fn) else None
+    if not note or not isinstance(function_result, (str, type(None))):
+        return function_result
+    return (function_result or "") + "\n\n" + note
+
+
 class AIAgent(
     ClientLifecycleMixin, StreamDeliveryMixin, StatusOutputMixin, ApiRequestHooksMixin, ApiErrorSummaryMixin,
     InterruptControlMixin, TurnExplainersMixin, ActivityTrackingMixin, RateLimitCreditsMixin,
@@ -1307,6 +1318,7 @@ class AIAgent(
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
         record_guardrail_warnings(self, decision, stall_kind if stall_notice else None)
+        first_halt = self._tool_guardrail_halt_decision is None
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         else:
@@ -1317,6 +1329,8 @@ class AIAgent(
                 self._set_tool_guardrail_halt(streak_halt)
         if stall_notice:
             function_result = (function_result or "") + "\n\n" + stall_notice
+        if first_halt and self._tool_guardrail_halt_decision is not None:
+            function_result = _with_guardrail_recovery_note(self, function_result)
         return function_result
 
     def _stall_guards_enabled(self) -> bool:
@@ -1324,8 +1338,10 @@ class AIAgent(
         return bool(getattr(self, "_stall_guards", True))
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
+        first_halt = self._tool_guardrail_halt_decision is None
         self._set_tool_guardrail_halt(decision)
-        return toolguard_synthetic_result(decision)
+        result = toolguard_synthetic_result(decision)
+        return _with_guardrail_recovery_note(self, result) if first_halt else result
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute the assistant's tool calls and append results to ``messages``.

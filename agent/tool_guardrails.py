@@ -301,6 +301,15 @@ _IDENTICAL_CYCLE_NOTICE = (
     "proceed with what you have.]"
 )
 
+# Appended to the tool result that raised the turn's first halt (persisted with it), when that halt
+# will be converted into one recovery iteration instead of ending the turn.
+GUARDRAIL_RECOVERY_NOTE = (
+    "[System: the tool-loop guard stopped {tool_name} after {count} attempts without progress, and "
+    "that exact call is now blocked for this turn. Do not repeat it. Use the results you already "
+    "have, take a different approach with a different tool call, or give your answer. Another "
+    "loop-guard stop this turn ends the turn.]"
+)
+
 # tool -> (LoopCapConfig field, controller counter attribute, decision code)
 _LOOP_CAPS: dict[str, tuple[str, str, str]] = {
     "web_search": ("max_web_searches", "_turn_web_search_count", "loop_web_search_cap"),
@@ -361,6 +370,12 @@ class ToolCallGuardrailController:
         if decision.should_halt:
             self._halt_decision = decision
         return decision
+
+    def recovery_note(self, decision: ToolGuardrailDecision) -> str | None:
+        """Corrective note for a halt that ``begin_halt_recovery`` will still grant, else None."""
+        if self._halt_recoveries_used >= 1 or not decision.should_halt:
+            return None
+        return GUARDRAIL_RECOVERY_NOTE.format(tool_name=decision.tool_name or "the same tool", count=decision.count)
 
     def begin_halt_recovery(self, decision: ToolGuardrailDecision) -> bool:
         """Grant one recovery iteration for the turn's first halt: block the halted signature for

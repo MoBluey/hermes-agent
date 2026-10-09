@@ -16,8 +16,9 @@ import pytest
 
 from agent.agent_runtime_helpers import visible_reply_announces_action
 from agent.conversation_loop import _CODEX_ACK_CONTINUATION_NUDGE
-from agent.tool_guardrails import ToolCallGuardrailConfig, ToolCallGuardrailController
-from agent.turn_tool_round import _GUARDRAIL_RECOVERY_NOTE
+from agent.tool_guardrails import (
+    GUARDRAIL_RECOVERY_NOTE as _GUARDRAIL_RECOVERY_NOTE, ToolCallGuardrailConfig, ToolCallGuardrailController,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -246,3 +247,46 @@ def test_second_halt_in_the_same_turn_ends_it(loop_agent):
     assert loop_agent.client.chat.completions.create.call_count == 6
     assert result["guardrail"]["code"] == "halted_call_block"
     assert "I stopped retrying" in result["final_response"]
+
+
+def test_recovery_note_is_on_the_persisted_tool_row(loop_agent):
+    """The note is part of the tool row when it is built, so the stored row equals the wire row."""
+    loop_agent._tool_guardrails = _hard_stop_controller()
+    stages = [_tool_round(f"call_{i}", name="terminal", arguments='{"command": "ls"}') for i in range(5)]
+    stages.append(_final("The directory has 3 files."))
+    flushes = []
+
+    def flush(messages, *_a, **_k):
+        flushes.append([dict(m) for m in messages if isinstance(m, dict)])
+
+    loop_agent.client.chat.completions.create.side_effect = stages
+    with (
+        patch.object(loop_agent, "_persist_session", side_effect=flush),
+        patch.object(loop_agent, "_flush_messages_to_session_db", side_effect=flush),
+        patch.object(loop_agent, "_save_trajectory"),
+        patch.object(loop_agent, "_cleanup_task_resources"),
+        patch("model_tools.handle_function_call", return_value="ok"),
+    ):
+        loop_agent.run_conversation("list it")
+
+    note_prefix = _GUARDRAIL_RECOVERY_NOTE.split("{")[0]
+    # Every flush that holds the halting tool row (call_4) already carries the note.
+    halting_rows = [m for snap in flushes for m in snap if m.get("tool_call_id") == "call_4"]
+    assert halting_rows, "the halting tool row was never flushed"
+    assert all(note_prefix in m["content"] for m in halting_rows)
+    stored_tools = [m for m in flushes[-1] if m.get("role") == "tool"]
+    assert sum(note_prefix in (m.get("content") or "") for m in stored_tools) == 1
+    # What the model received on the recovery call is the same row.
+    sent = loop_agent.client.chat.completions.create.call_args_list[5].kwargs["messages"]
+    sent_tools = [m for m in sent if m.get("role") == "tool"]
+    assert sent_tools[-1]["content"] == stored_tools[-1]["content"]
+
+
+def test_note_only_when_recovery_is_still_available():
+    controller = _hard_stop_controller()
+    for _ in range(5):
+        controller.observe_call("terminal", {"command": "ls"}, "same")
+    halt = controller.halt_decision
+    assert controller.recovery_note(halt)
+    controller.begin_halt_recovery(halt)
+    assert controller.recovery_note(controller.before_call("terminal", {"command": "ls"})) is None
