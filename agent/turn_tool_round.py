@@ -43,6 +43,32 @@ class ToolRoundVerdict:
     result: Optional[Dict[str, Any]] = None
 
 
+_GUARDRAIL_RECOVERY_NOTE = (
+    "[System: the tool-loop guard stopped {tool_name} after {count} attempts without progress, and "
+    "that exact call is now blocked for this turn. Do not repeat it. Use the results you already "
+    "have, take a different approach with a different tool call, or give your answer. Another "
+    "loop-guard stop this turn ends the turn.]"
+)
+
+
+def _append_guardrail_recovery_note(messages: Any, decision: Any) -> bool:
+    """Append the halt-recovery note to the current (unpersisted) tool-result tail."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    if not messages or not isinstance(messages[-1], dict) or messages[-1].get("role") != "tool" \
+            or messages[-1].get(_DB_PERSISTED_MARKER):
+        return False
+    note = _GUARDRAIL_RECOVERY_NOTE.format(tool_name=decision.tool_name or "the same tool", count=decision.count)
+    message = messages[-1]
+    content = message.get("content", "")
+    if isinstance(content, str):
+        message["content"] = content + f"\n\n{note}"
+    elif isinstance(content, list) or content is None:
+        message["content"] = [*(content or []), {"type": "text", "text": note}]
+    else:
+        return False
+    return True
+
+
 def run_tool_round(
     agent: Any, *, assistant_message: Any, finish_reason: Any, messages: Any,
     conversation_history: Any, api_call_count: Any, effective_task_id: Any, user_message: Any,
@@ -173,6 +199,17 @@ def run_tool_round(
         failed = True
         return _verdict("break")
 
+    if agent._tool_guardrail_halt_decision is not None:
+        decision = agent._tool_guardrail_halt_decision
+        _begin_recovery = getattr(agent._tool_guardrails, "begin_halt_recovery", None)
+        if callable(_begin_recovery) and _begin_recovery(decision):
+            # First halt this turn: the halted call is now blocked and the model gets one
+            # corrective iteration. A second halt in the same turn ends it.
+            agent._tool_guardrail_halt_decision = None
+            agent._emit_diagnostic_status(
+                f"⚠️ Tool guardrail stopped {decision.tool_name} ({decision.code}); one recovery attempt"
+            )
+            _append_guardrail_recovery_note(messages, decision)
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
         _turn_exit_reason = "guardrail_halt"

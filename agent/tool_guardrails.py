@@ -273,6 +273,10 @@ _DECISION_MESSAGES: dict[str, str] = {
         "arguments and identical results has run {count} times. Repeating the batch unchanged is not "
         "progress; use the results already provided or change strategy."
     ),
+    "halted_call_block": (
+        "Blocked {tool_name}: this exact call was already stopped by the tool-loop guard this turn. "
+        "Do not repeat it; use the results already provided, change approach, or give your answer."
+    ),
     "loop_web_search_cap": (
         "Blocked web_search: this turn has already made {cap} web searches, the per-turn limit. "
         "This looks like a runaway search loop. Work with the results you already have and give the user your answer."
@@ -337,6 +341,10 @@ class ToolCallGuardrailController:
         self._persisted_result_paths: dict[str, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        # Halt recovery: the first halt of a turn blocks its call signature and lets the model take
+        # one corrective iteration; only a second halt in the same turn ends it.
+        self._halt_recoveries_used = 0
+        self._recovery_blocked_signatures: set[ToolCallSignature] = set()
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -354,10 +362,28 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
         return decision
 
+    def begin_halt_recovery(self, decision: ToolGuardrailDecision) -> bool:
+        """Grant one recovery iteration for the turn's first halt: block the halted signature for
+        the rest of the turn and clear the halt. False once the recovery is spent (end the turn)."""
+        if self._halt_recoveries_used >= 1:
+            return False
+        self._halt_recoveries_used += 1
+        if decision.signature is not None:
+            self._recovery_blocked_signatures.add(decision.signature)
+        self._halt_decision = None
+        # Restart loop detection so the recovery iteration is judged on its own calls.
+        self._identical_streak_sig = None
+        self._identical_streak_result_hash = ""
+        self._identical_streak_count = 0
+        self._call_history.clear()
+        return True
+
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
         allow = ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+        if signature in self._recovery_blocked_signatures:
+            return self._decide("block", "halted_call_block", tool_name, 1, signature)
 
         # Loop caps apply regardless of hard_stop_enabled (which only governs the detector).
         cap_block = self._check_loop_cap(tool_name, args, signature)

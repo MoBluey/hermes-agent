@@ -3425,6 +3425,34 @@ def promoted_reasoning_announces_action(text: str) -> bool:
     return bool(_PROMOTED_REASONING_PLAN_TAIL_RE.search(t[-240:]))
 
 
+# Visible-text variant of the plan-tail detector, used only when intent-ack continuation is
+# enabled for the active model (``agent.intent_ack_continuation`` list/true). Local models often
+# stop on "Let me write the parse script to a file first, then run it." with zero tool calls; the
+# narrow ``let me now`` shape misses that. A real reply can end on a first-person sign-off, so the
+# last sentence is screened for closings ("let me know", "I'll wait"), user-directed offers and
+# conditions ("if you want", "once you confirm") before it counts as an announced action.
+_VISIBLE_PLAN_TAIL_CLOSING_RE = re.compile(
+    r"\blet (?:me|us) know\b"
+    r"|\bi(?:['’]ll| will| am going to|['’]m going to)\s+"
+    r"(?:wait|stop|leave|be (?:here|around|available|happy|glad)|keep (?:an eye|watching|monitoring))\b"
+    r"|\byou(?:['’]d)? (?:like|want|prefer|need)\b|\b(?:from|with|to) you\b"
+    r"|\bi (?:need to|should) (?:note|mention|add|stress|point out|flag|clarify)\b",
+    re.IGNORECASE,
+)
+_LAST_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+|\n+")
+
+
+def visible_reply_announces_action(text: str) -> bool:
+    """Whether a VISIBLE reply ends on a first-person plan to act (with no tool call it is a stall)."""
+    t = (text or "").strip()
+    if not t or not promoted_reasoning_announces_action(t):
+        return False
+    last = [s for s in _LAST_SENTENCE_SPLIT_RE.split(t) if s.strip()][-1]
+    if _VISIBLE_PLAN_TAIL_CLOSING_RE.search(last):
+        return False
+    return not _POSTPOSED_CONTINUE_CONDITION_RE.search(last)
+
+
 _INTENT_ACK_ON = {"true", "always", "yes", "on"}
 _INTENT_ACK_OFF = {"false", "never", "no", "off"}
 

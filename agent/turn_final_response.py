@@ -156,7 +156,7 @@ def finish_text_response(
     # conversation context and the cached prompt prefix stay byte-identical.
     from agent.agent_runtime_helpers import (
         intent_ack_continuation_mode, looks_like_degenerate_final, promoted_reasoning_announces_action,
-        tool_results_this_turn, trailing_continue_intent,
+        tool_results_this_turn, trailing_continue_intent, visible_reply_announces_action,
     )
 
     _ack_mode = intent_ack_continuation_mode(agent)
@@ -174,6 +174,9 @@ def finish_text_response(
         and (
             trailing_continue_intent(_stall_text)
             or (bool(_promoted) and promoted_reasoning_announces_action(_stall_text))
+            # Opted-in models (intent_ack_continuation list/true): visible text ending on an
+            # announced action ("Let me write the script to a file first, then run it.").
+            or (_ack_mode == "all" and not _promoted and visible_reply_announces_action(_stall_text))
         )
     )
     # Degenerate-final guard (#103483): the turn did real tool work and then stopped on a
